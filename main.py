@@ -89,10 +89,22 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def calc_vwap_daily(df_5m: pd.DataFrame) -> pd.Series:
-    """5分足データに対し、日毎にリセットされるVWAPを計算する。"""
+    """5分足データに対し、日毎にリセットされるVWAPを計算する。
+    FXのyfinanceデータは出来高(volume)が0のことが多く、その場合は
+    本来のVWAP計算(出来高加重)ができないため、単純平均(等加重)に
+    フォールバックする。
+    """
     df = df_5m.copy()
     df["date"] = df.index.date
     typical = (df["high"] + df["low"] + df["close"]) / 3
+
+    total_volume = df["volume"].sum()
+    if total_volume == 0:
+        # 出来高データがない(FXでは一般的) → 単純平均でフォールバック
+        df["cum_typ"] = typical.groupby(df["date"]).cumsum()
+        df["count"] = df.groupby("date").cumcount() + 1
+        return df["cum_typ"] / df["count"]
+
     df["tp_vol"] = typical * df["volume"]
     df["cum_tp_vol"] = df.groupby("date")["tp_vol"].cumsum()
     df["cum_vol"] = df.groupby("date")["volume"].cumsum()
