@@ -328,6 +328,60 @@ def is_near_high_impact_event(events: list, currencies=("USD", "JPY"),
     }
 
 
+def fetch_cot_report(weeks: int = 2) -> list:
+    """CFTC(米商品先物取引委員会)のTFFレポート(Traders in Financial Futures)から
+    円先物(CME上場の標準契約)のポジションデータを取得する。APIキー不要、無料。
+    直近weeks週分を新しい順に取得する。
+    完全一致で契約名を指定し、類似の別契約(ミニ先物等)との混同を防ぐ。
+    """
+    url = "https://publicreporting.cftc.gov/resource/gpe5-46if.json"
+    params = {
+        "$where": "market_and_exchange_names = 'JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE'",
+        "$order": "report_date_as_yyyy_mm_dd DESC",
+        "$limit": weeks,
+    }
+    resp = requests.get(url, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def summarize_cot(records: list) -> dict:
+    """レバレッジドファンド(投機筋)の円先物ネットポジションと、
+    前週からの変化を要約する。フィールド名はCFTC側の仕様に依存するため、
+    取得できない場合は安全側に倒してNoneを返す。
+    """
+    if not records or len(records) < 1:
+        return {"available": False}
+
+    def get_net(rec: dict):
+        try:
+            long_ = float(rec.get("lev_money_positions_long", 0) or 0)
+            short_ = float(rec.get("lev_money_positions_short", 0) or 0)
+            return long_ - short_
+        except (TypeError, ValueError):
+            return None
+
+    latest = records[0]
+    net_latest = get_net(latest)
+    if net_latest is None:
+        return {"available": False}
+
+    result = {
+        "available": True,
+        "contract_name": latest.get("market_and_exchange_names", "不明"),
+        "report_date": latest.get("report_date_as_yyyy_mm_dd", "不明"),
+        "net_position": net_latest,
+        "net_change": None,
+    }
+
+    if len(records) >= 2:
+        net_prev = get_net(records[1])
+        if net_prev is not None:
+            result["net_change"] = net_latest - net_prev
+
+    return result
+
+
 # ============================================================
 # 6. スコアリングエンジン(100点満点)
 # ============================================================
@@ -519,6 +573,27 @@ def main():
     if econ_check["nearest_event"]:
         print(f"  直近の重要指標: {econ_check['nearest_event']} (前後{econ_check['nearest_diff_minutes']}分)")
     print(f"  → 発表前後30分以内: {econ_check['is_near']}")
+
+    # --- COTレポート(投機筋の円先物ポジション、参考情報) ---
+    try:
+        cot_records = fetch_cot_report(weeks=2)
+        cot_summary = summarize_cot(cot_records)
+    except Exception as e:
+        print(f"\n[COTレポート取得失敗] {e}")
+        cot_summary = {"available": False}
+
+    print(f"\n【COTレポート(投機筋の円先物ポジション・参考情報)】")
+    if cot_summary.get("available"):
+        net = cot_summary["net_position"]
+        change = cot_summary["net_change"]
+        position_jp = "円買い越し" if net > 0 else "円売り越し"
+        print(f"  契約: {cot_summary['contract_name']}")
+        print(f"  レポート日: {cot_summary['report_date']}")
+        print(f"  レバレッジドファンドのネットポジション: {net:+.0f}枚 ({position_jp})")
+        if change is not None:
+            print(f"  前週比: {change:+.0f}枚")
+    else:
+        print("  データ取得不可(スコアには影響しません)")
 
     score = calc_score(
         env_score=env["score"],
