@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # ============================================================
 # 1. データ取得
@@ -287,6 +287,47 @@ def judge_macro_alignment(usdjpy_df: pd.DataFrame, dxy_df: pd.DataFrame, us2y_df
     }
 
 
+def fetch_economic_calendar() -> list:
+    """Forex Factoryが提供する無料の週間経済指標カレンダー(JSON)を取得する。
+    APIキー不要。リクエスト頻度は5分に2回程度までに抑えることが推奨されている。
+    """
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def is_near_high_impact_event(events: list, currencies=("USD", "JPY"),
+                                window_minutes: int = 30) -> dict:
+    """USD/JPYに関わる重要度Highの指標発表の前後window_minutes分以内かを判定する。"""
+    now = datetime.now(timezone.utc)
+    nearest = None
+    nearest_diff = None
+
+    for e in events:
+        if e.get("country") not in currencies:
+            continue
+        if e.get("impact") != "High":
+            continue
+        try:
+            event_time = datetime.fromisoformat(e["date"])
+        except (KeyError, ValueError):
+            continue
+        if event_time.tzinfo is None:
+            continue
+        diff_minutes = abs((event_time - now).total_seconds()) / 60
+        if nearest_diff is None or diff_minutes < nearest_diff:
+            nearest_diff = diff_minutes
+            nearest = e
+
+    is_near = nearest_diff is not None and nearest_diff <= window_minutes
+    return {
+        "is_near": is_near,
+        "nearest_event": nearest.get("title") if nearest else None,
+        "nearest_diff_minutes": round(nearest_diff, 1) if nearest_diff is not None else None,
+    }
+
+
 # ============================================================
 # 6. スコアリングエンジン(100点満点)
 # ============================================================
@@ -466,13 +507,26 @@ def main():
     key_level_near = any(abs(latest_price - lv["price"]) < 0.15 for lv in key_levels)
     atr_ratio_ok = 0.03 < latest_atr < 0.20  # 5分足ATRの適正レンジ(仮)
 
+    # --- 経済指標カレンダー(発表前後30分は減点) ---
+    try:
+        econ_events = fetch_economic_calendar()
+        econ_check = is_near_high_impact_event(econ_events, window_minutes=30)
+    except Exception as e:
+        print(f"\n[経済指標カレンダー取得失敗] {e} → 安全側に倒し、発表直前とみなします")
+        econ_check = {"is_near": True, "nearest_event": None, "nearest_diff_minutes": None}
+
+    print(f"\n【経済指標カレンダー】")
+    if econ_check["nearest_event"]:
+        print(f"  直近の重要指標: {econ_check['nearest_event']} (前後{econ_check['nearest_diff_minutes']}分)")
+    print(f"  → 発表前後30分以内: {econ_check['is_near']}")
+
     score = calc_score(
         env_score=env["score"],
         trend_result=trend_1h,
         macro_result=macro,
         key_levels_near=key_level_near,
         atr_ratio_ok=atr_ratio_ok,
-        near_indicator_time=False,  # Phase2で経済指標カレンダー連携後に自動判定
+        near_indicator_time=econ_check["is_near"],
     )
     print("\n【スコア内訳】")
     for k, v in score.items():
