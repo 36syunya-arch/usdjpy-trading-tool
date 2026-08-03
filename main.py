@@ -174,7 +174,11 @@ def resample_ohlcv(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 
 
 def judge_environment(trend_1h: dict, trend_4h: dict, trend_1d: dict) -> dict:
-    """1h/4h/日足のトレンド方向一致度から環境認識スコアを機械的に算出する。"""
+    """1h/4h/日足のトレンド方向一致度から環境認識スコアを機械的に算出する。
+    以前は「3つ完全一致(20点)/2つ一致(10点)/それ以外0点」の3段階だったが、
+    これだと「1つだけトレンド、残り2つはレンジ(矛盾ではない)」のケースまで
+    0点になり、極端に厳しすぎたため、矛盾の有無で段階を追加する。
+    """
     trends = [trend_1h["trend"], trend_4h["trend"], trend_1d["trend"]]
     up = trends.count("上昇トレンド")
     down = trends.count("下降トレンド")
@@ -184,10 +188,53 @@ def judge_environment(trend_1h: dict, trend_4h: dict, trend_1d: dict) -> dict:
     if down == 3:
         return {"score": 20, "direction": "short", "detail": "1h/4h/日足すべて下降一致"}
     if up == 2:
-        return {"score": 10, "direction": "long", "detail": "3時間足中2つが上昇一致"}
+        return {"score": 15, "direction": "long", "detail": "3時間足中2つが上昇一致"}
     if down == 2:
-        return {"score": 10, "direction": "short", "detail": "3時間足中2つが下降一致"}
-    return {"score": 0, "direction": None, "detail": "方向性バラバラ(環境不一致)"}
+        return {"score": 15, "direction": "short", "detail": "3時間足中2つが下降一致"}
+    # 上昇・下降が同時に出現していない(矛盾していない)場合は部分点を与える
+    if up >= 1 and down == 0:
+        return {"score": 8, "direction": "long", "detail": "1つのみ上昇、他はレンジ(矛盾なし)"}
+    if down >= 1 and up == 0:
+        return {"score": 8, "direction": "short", "detail": "1つのみ下降、他はレンジ(矛盾なし)"}
+    if up == 0 and down == 0:
+        return {"score": 3, "direction": None, "detail": "全時間足レンジ(方向感なし)"}
+    return {"score": 0, "direction": None, "detail": "上昇・下降が同時に出現(明確な矛盾)"}
+
+
+def detect_breakout(df: pd.DataFrame, lookback: int = 10) -> str:
+    """直近lookback本(直近1本を除く)の高値/安値を、最新の終値が
+    明確に超えているかを判定する。スイング確定待ちによる遅れを
+    補うための即応性の高い補助シグナル。
+    """
+    if len(df) < lookback + 2:
+        return None
+    recent_low = df["low"].iloc[-lookback - 1:-1].min()
+    recent_high = df["high"].iloc[-lookback - 1:-1].max()
+    last_close = df["close"].iloc[-1]
+    if last_close < recent_low:
+        return "down"
+    if last_close > recent_high:
+        return "up"
+    return None
+
+
+def judge_trend_with_breakout(df_with_swings: pd.DataFrame, df_raw: pd.DataFrame,
+                                lookback_swings: int = 4, breakout_lookback: int = 10) -> dict:
+    """スイング確定ベースのトレンド判定に、ブレイクアウト補正を加える。
+    スイング判定は前後window本のデータが揃わないと確定しないため、
+    急な反転直後は「古いトレンドのまま」と誤判定しやすい。
+    直近の明確なブレイクアウトが逆方向を示している場合はそちらを優先する。
+    """
+    swing_result = judge_trend(df_with_swings, lookback_swings)
+    brk = detect_breakout(df_raw, breakout_lookback)
+    brk_trend = {"down": "下降トレンド", "up": "上昇トレンド"}.get(brk)
+
+    if brk_trend and brk_trend != swing_result["trend"]:
+        return {
+            "trend": brk_trend,
+            "reason": f"直近{breakout_lookback}本のレンジを明確にブレイク(スイング確定待ちの遅れを補正)",
+        }
+    return swing_result
 
 
 def judge_trend(df_with_swings: pd.DataFrame, lookback_swings: int = 4) -> dict:
@@ -303,7 +350,7 @@ def calc_lot_size(account_balance: float, risk_percent: float, risk_pips: float,
                    pip_value_per_lot: float = 1000.0) -> dict:
     """
     account_balance: 口座残高(円)
-    risk_percent: 1トレードあたりの許容リスク(%) 例: 3.5
+    risk_percent: 1トレードあたりの許容リスク(%) 例: 1.0
     risk_pips: 損切りまでのpips数
     pip_value_per_lot: 1lot(10万通貨)あたり1pipの評価額(円) ※USDJPYは概ね1000円/lot
     """
@@ -383,7 +430,7 @@ def main():
     # --- スイング・水平線 ---
     df_1h_sw = find_swing_points(df_1h, window=3)
     key_levels = extract_key_levels(df_1h_sw, lookback=100, top_n=5)
-    trend_1h = judge_trend(df_1h_sw)
+    trend_1h = judge_trend_with_breakout(df_1h_sw, df_1h, lookback_swings=4, breakout_lookback=10)
 
     print("【重要水平線(直近1hより)】")
     for lv in key_levels:
@@ -393,10 +440,10 @@ def main():
     # --- 環境認識自動判定(1h/4h/日足) ---
     df_4h = resample_ohlcv(df_1h, "4h")
     df_4h_sw = find_swing_points(df_4h, window=2)
-    trend_4h = judge_trend(df_4h_sw, lookback_swings=3)
+    trend_4h = judge_trend_with_breakout(df_4h_sw, df_4h, lookback_swings=3, breakout_lookback=10)
 
     df_1d_sw = find_swing_points(df_1d, window=2)
-    trend_1d = judge_trend(df_1d_sw, lookback_swings=3)
+    trend_1d = judge_trend_with_breakout(df_1d_sw, df_1d, lookback_swings=3, breakout_lookback=10)
 
     env = judge_environment(trend_1h, trend_4h, trend_1d)
     print(f"\n【環境認識(マルチタイムフレーム)】")
