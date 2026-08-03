@@ -500,6 +500,13 @@ def main():
     for k, v in sltp.items():
         print(f"  {k}: {v}")
 
+    # --- デイトレ適合チェック(SL距離が広すぎる場合は見送り) ---
+    MAX_RISK_PIPS_FOR_DAYTRADE = 60
+    style_ok = sltp["risk_pips"] <= MAX_RISK_PIPS_FOR_DAYTRADE
+    if not style_ok:
+        print(f"\n[スタイル不適合] risk_pips={sltp['risk_pips']}が上限{MAX_RISK_PIPS_FOR_DAYTRADE}pipsを超過")
+        print("  → SLが遠すぎるため、スコアに関わらずデイトレとしては見送り推奨とします")
+
     lot = calc_lot_size(account_balance=272_778, risk_percent=3.5, risk_pips=sltp["risk_pips"])
     lot["input_quantity_x1000"] = round(lot.get("recommended_lot", 0) * 100)
     print("\n【ロット計算(口座残高272,778円・リスク3.5%想定)】")
@@ -507,9 +514,11 @@ def main():
         print(f"  {k}: {v}")
     print(f"  → SBI画面(×1,000単位)への入力数値: {lot['input_quantity_x1000']}")
 
-    # --- Discord通知(80点以上のみ) ---
-    if score["合計"] >= 80:
+    # --- Discord通知(80点以上 かつ デイトレ向きのSL距離のみ) ---
+    if score["合計"] >= 80 and style_ok:
         send_discord_notification(score, direction, sltp, lot, DISCORD_WEBHOOK_URL)
+    elif score["合計"] >= 80 and not style_ok:
+        print(f"\n[通知なし] スコアは{score['合計']}点で基準達成だが、SL距離{sltp['risk_pips']}pipsがデイトレ向きではないため見送り")
     else:
         print(f"\n[通知なし] スコア{score['合計']}点のため見送り(80点未満は通知しません)")
 
