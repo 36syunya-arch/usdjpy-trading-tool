@@ -261,17 +261,57 @@ def combine_key_levels(long_term_levels: list, short_term_levels: list, top_n: i
     return combined[:top_n]
 
 
-def calc_vwap_alignment(df_5m: pd.DataFrame, direction: str) -> dict:
-    """現在値がVWAPに対してエントリー方向と整合的な位置にあるかを判定する。"""
+def calc_vwap_alignment(df_5m: pd.DataFrame, direction: str, atr: float) -> dict:
+    """現在値がVWAPに対してエントリー方向と整合的な位置にあるかを、
+    ATR(値動きの大きさ)に対する比率で段階評価する。
+    僅かな価格変動で0点/10点が反転する脆さを防ぐため、
+    「一致/不一致」の2値ではなく、乖離の大きさに応じて5段階で評価する。
+    """
     last_close = df_5m["close"].iloc[-1]
     last_vwap = df_5m["vwap"].iloc[-1]
-    if pd.isna(last_vwap):
-        return {"aligned": False, "diff": None}
-    if direction == "long":
-        aligned = last_close > last_vwap
+    if pd.isna(last_vwap) or not atr or pd.isna(atr) or atr <= 0:
+        return {"score": 5, "diff": None, "ratio": None, "note": "データ不足のため中立点"}
+
+    diff = last_close - last_vwap
+    # directional_diffが正 = エントリー方向にVWAPから明確に離れている(優位)
+    directional_diff = diff if direction == "long" else -diff
+    ratio = directional_diff / atr
+
+    if ratio >= 0.5:
+        score = 10
+    elif ratio >= 0.15:
+        score = 7
+    elif ratio >= -0.15:
+        score = 5  # VWAP付近(僅差)は中立点。ここで0/10が反転する脆さを解消
+    elif ratio >= -0.5:
+        score = 2
     else:
-        aligned = last_close < last_vwap
-    return {"aligned": bool(aligned), "diff": round(float(last_close - last_vwap), 3)}
+        score = 0
+
+    return {"score": score, "diff": round(float(diff), 3), "ratio": round(float(ratio), 2)}
+
+
+def calc_key_level_score(latest_price: float, key_levels: list, atr: float) -> dict:
+    """最も近い水平線までの距離を、ATRに対する比率で段階評価する。
+    固定値(0.15円など)の閾値だと僅かな価格変動で15点/5点が
+    反転しやすいため、値動きの大きさに応じた相対評価に変更する。
+    """
+    if not key_levels or not atr or pd.isna(atr) or atr <= 0:
+        return {"score": 5, "nearest_distance": None, "ratio": None}
+
+    nearest_distance = min(abs(latest_price - lv["price"]) for lv in key_levels)
+    ratio = nearest_distance / atr
+
+    if ratio <= 1.0:
+        score = 15
+    elif ratio <= 2.0:
+        score = 10
+    elif ratio <= 4.0:
+        score = 5
+    else:
+        score = 2
+
+    return {"score": score, "nearest_distance": round(float(nearest_distance), 3), "ratio": round(float(ratio), 2)}
 
 
 def judge_session_breakout(df_5m: pd.DataFrame, direction: str, lookback: int = 24) -> dict:
@@ -451,25 +491,25 @@ def summarize_cot(records: list) -> dict:
 # ============================================================
 
 def calc_score(env_score: int, trend_result: dict, macro_result: dict,
-               key_levels_near: bool, atr_ratio_ok: bool, near_indicator_time: bool,
+               key_level_result: dict, atr_ratio_ok: bool, near_indicator_time: bool,
                vwap_result: dict, breakout_result: dict, momentum_result: dict) -> dict:
     """
-    配点(短期軸=5分足の根拠を主軸に、上位足は補助情報として軽く扱う設計に変更):
-      VWAP位置                10点(新設)
-      セッション高安値ブレイク  15点(新設)
-      モメンタム(直近の勢い)   10点(新設)
-      重要ライン近接           15点
-      トレンド判定(1h)        15点(20→15に引き下げ)
-      環境認識(上位足整合)     10点(20→10に大幅引き下げ、絶対条件から補助情報へ)
-      DXY方向一致              10点(15→10)
-      米2年債方向一致           5点(10→5)
-      ボラティリティ適正        5点(10→5)
-      経済指標                  5点(10→5、発表前後は0点)
+    配点(短期軸=5分足の根拠を主軸に、上位足は補助情報として軽く扱う設計):
+      VWAP位置                10点(ATR基準の段階評価)
+      セッション高安値ブレイク  15点
+      モメンタム(直近の勢い)   10点
+      重要ライン近接           15点(ATR基準の段階評価)
+      トレンド判定(1h)        15点
+      環境認識(上位足整合)     10点
+      DXY方向一致              10点
+      米2年債方向一致           5点
+      ボラティリティ適正        5点
+      経済指標                  5点(発表前後は0点)
     """
     scores = {}
 
-    # --- 短期軸(5分足)の根拠を主軸に ---
-    scores["VWAP位置"] = 10 if vwap_result.get("aligned") else 0
+    # --- 短期軸(5分足)の根拠を主軸に(段階評価で微小変動による反転を防止) ---
+    scores["VWAP位置"] = vwap_result["score"]
 
     if breakout_result.get("aligned") is True:
         scores["セッションブレイク"] = 15
@@ -485,7 +525,7 @@ def calc_score(env_score: int, trend_result: dict, macro_result: dict,
     else:
         scores["モメンタム"] = 3
 
-    scores["重要ライン"] = 15 if key_levels_near else 5
+    scores["重要ライン"] = key_level_result["score"]
     scores["トレンド(1h)"] = 15 if trend_result["trend"] in ("上昇トレンド", "下降トレンド") else 5
 
     # --- 上位足・マクロは補助情報として軽めに ---
@@ -654,7 +694,7 @@ def main():
     # --- 簡易スコア計算(サンプル値、実運用では各種判定関数の結果を渡す) ---
     latest_price = df_5m["close"].iloc[-1]
     latest_atr = df_5m["atr"].iloc[-1]
-    key_level_near = any(abs(latest_price - lv["price"]) < 0.15 for lv in key_levels)
+    key_level_result = calc_key_level_score(latest_price, key_levels, latest_atr)
     atr_ratio_ok = 0.03 < latest_atr < 0.20  # 5分足ATRの適正レンジ(仮)
 
     # --- 経済指標カレンダー(発表前後30分は減点) ---
@@ -692,12 +732,13 @@ def main():
         print("  データ取得不可(スコアには影響しません)")
 
     # --- 短期軸(5分足)の根拠を判定 ---
-    vwap_result = calc_vwap_alignment(df_5m, direction)
+    vwap_result = calc_vwap_alignment(df_5m, direction, atr=latest_atr)
     breakout_result = judge_session_breakout(df_5m, direction, lookback=24)
     momentum_result = judge_momentum(df_5m, direction, lookback=12)
 
     print(f"\n【短期軸(5分足)の根拠】")
-    print(f"  VWAP位置: 現在値-VWAP = {vwap_result['diff']}  方向一致: {vwap_result['aligned']}")
+    print(f"  VWAP位置: 現在値-VWAP = {vwap_result['diff']}  ATR比: {vwap_result['ratio']}  スコア: {vwap_result['score']}")
+    print(f"  重要ライン最近接距離: {key_level_result['nearest_distance']}円  ATR比: {key_level_result['ratio']}  スコア: {key_level_result['score']}")
     print(f"  セッションブレイク: {breakout_result['state']}")
     print(f"  モメンタム(直近1時間): {momentum_result['move_pips']}pips  方向一致: {momentum_result['aligned']}")
 
@@ -705,7 +746,7 @@ def main():
         env_score=env["score"],
         trend_result=trend_1h,
         macro_result=macro,
-        key_levels_near=key_level_near,
+        key_level_result=key_level_result,
         atr_ratio_ok=atr_ratio_ok,
         near_indicator_time=econ_check["is_near"],
         vwap_result=vwap_result,
