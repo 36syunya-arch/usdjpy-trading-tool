@@ -1,1 +1,0 @@
-# usdjpy-trading-tool
