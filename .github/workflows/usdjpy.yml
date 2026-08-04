@@ -3,17 +3,15 @@ name: USDJPY signal check
 on:
   workflow_dispatch:
   schedule:
-    # 日本時間・平日8:07〜23:47、20分ごと
-    - cron: "7,27,47 8-23 * * 1-5"
-      timezone: "Asia/Tokyo"
- 
+    - cron: "*/20 23 * * 0-4"
+    - cron: "*/20 0-15 * * 1-5"
 
 permissions:
   contents: read
 
 concurrency:
   group: usdjpy-signal-check
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   analyze:
@@ -37,7 +35,6 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .signal_state.json
-          # run_id を含めることで毎回保存し、restore-keys で直近状態を復元する。
           key: usdjpy-signal-state-${{ github.run_id }}
           restore-keys: |
             usdjpy-signal-state-
