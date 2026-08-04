@@ -291,6 +291,48 @@ def calc_vwap_alignment(df_5m: pd.DataFrame, direction: str, atr: float) -> dict
     return {"score": score, "diff": round(float(diff), 3), "ratio": round(float(ratio), 2)}
 
 
+def calc_trend_score(trend_result: dict, df_1h: pd.DataFrame, direction: str) -> dict:
+    """1h足のトレンド判定を段階評価する。
+    スイング判定だけだと「レンジ」になる頻度が非常に高く、事実上ほぼ常に
+    最低点で固定されてしまうため、EMA20との位置関係・傾きも加味する。
+    """
+    ema20 = calc_ema(df_1h, 20)
+    last_close = df_1h["close"].iloc[-1]
+    last_ema = ema20.iloc[-1]
+    prev_ema = ema20.iloc[-6] if len(ema20) >= 6 else ema20.iloc[0]
+
+    price_above_ema = last_close > last_ema
+    price_ok = price_above_ema if direction == "long" else (not price_above_ema)
+
+    ema_rising = last_ema > prev_ema
+    slope_ok = ema_rising if direction == "long" else (not ema_rising)
+
+    swing_trend = trend_result["trend"]
+    swing_matches = (
+        (swing_trend == "上昇トレンド" and direction == "long") or
+        (swing_trend == "下降トレンド" and direction == "short")
+    )
+    swing_opposes = (
+        (swing_trend == "上昇トレンド" and direction == "short") or
+        (swing_trend == "下降トレンド" and direction == "long")
+    )
+
+    if swing_matches and price_ok and slope_ok:
+        score, detail = 15, "スイング・EMA位置・EMA傾きすべて方向一致"
+    elif swing_matches:
+        score, detail = 12, "スイング判定が方向一致"
+    elif price_ok and slope_ok:
+        score, detail = 10, "EMA20の位置・傾きが方向一致(スイングはレンジ)"
+    elif price_ok or slope_ok:
+        score, detail = 6, "EMA20の位置または傾きの一方が方向一致"
+    elif swing_opposes:
+        score, detail = 0, "スイング判定が明確に逆方向"
+    else:
+        score, detail = 3, "方向感が薄い"
+
+    return {"score": score, "detail": detail, "swing_trend": swing_trend}
+
+
 def calc_key_level_score(latest_price: float, key_levels: list, atr: float) -> dict:
     """最も近い水平線までの距離を、ATRに対する比率で段階評価する。
     固定値(0.15円など)の閾値だと僅かな価格変動で15点/5点が
@@ -315,17 +357,50 @@ def calc_key_level_score(latest_price: float, key_levels: list, atr: float) -> d
 
 
 def judge_session_breakout(df_5m: pd.DataFrame, direction: str, lookback: int = 24) -> dict:
-    """直近lookback本(5分足、24本=2時間)のセッション高安値に対するブレイクアウトを判定する。
-    エントリー方向と一致するブレイクは加点、逆方向のブレイクは減点、
-    ブレイクなし(レンジ内)は中立とする。
+    """直近lookback本(5分足)のレンジに対する現在価格の位置を段階評価する。
+    「ブレイクした瞬間」だけを加点する方式だと、20分間隔の実行では
+    その瞬間を捉えられる確率が極めて低く、事実上ほぼ常に中立点になってしまう。
+    そのため「レンジ内のどちら寄りにいるか」を連続的に評価する方式に変更する。
     """
-    brk = detect_breakout(df_5m, lookback=lookback)
-    brk_direction = {"up": "long", "down": "short"}.get(brk)
-    if brk_direction is None:
-        return {"state": "レンジ内(ブレイクなし)", "aligned": None}
-    if brk_direction == direction:
-        return {"state": f"直近{lookback}本の高安値を{direction}方向にブレイク", "aligned": True}
-    return {"state": f"直近{lookback}本の高安値を{direction}と逆方向にブレイク", "aligned": False}
+    if len(df_5m) < lookback + 2:
+        return {"score": 5, "state": "データ不足", "position_pct": None}
+
+    window = df_5m.iloc[-lookback - 1:-1]
+    range_high = window["high"].max()
+    range_low = window["low"].min()
+    last_close = df_5m["close"].iloc[-1]
+    range_width = range_high - range_low
+
+    if range_width <= 0:
+        return {"score": 5, "state": "レンジ幅ゼロ", "position_pct": None}
+
+    # 0% = レンジ下限, 100% = レンジ上限
+    position_pct = (last_close - range_low) / range_width * 100
+
+    # エントリー方向にとって有利な側にいるほど高得点
+    # long: 上限寄り(ブレイク方向)が有利 / short: 下限寄りが有利
+    directional_pct = position_pct if direction == "long" else (100 - position_pct)
+
+    if directional_pct >= 100:
+        score, state = 15, "レンジを完全にブレイク"
+    elif directional_pct >= 80:
+        score, state = 13, "ブレイク直前(レンジ端)"
+    elif directional_pct >= 60:
+        score, state = 10, "有利方向寄り"
+    elif directional_pct >= 40:
+        score, state = 6, "レンジ中央付近"
+    elif directional_pct >= 20:
+        score, state = 3, "不利方向寄り"
+    else:
+        score, state = 0, "不利方向の端"
+
+    return {
+        "score": score,
+        "state": state,
+        "position_pct": round(float(directional_pct), 1),
+        "range_low": round(float(range_low), 3),
+        "range_high": round(float(range_high), 3),
+    }
 
 
 def judge_momentum(df_5m: pd.DataFrame, direction: str, lookback: int = 12) -> dict:
@@ -490,16 +565,16 @@ def summarize_cot(records: list) -> dict:
 # 6. スコアリングエンジン(100点満点)
 # ============================================================
 
-def calc_score(env_score: int, trend_result: dict, macro_result: dict,
+def calc_score(env_score: int, trend_score_result: dict, macro_result: dict,
                key_level_result: dict, atr_ratio_ok: bool, near_indicator_time: bool,
                vwap_result: dict, breakout_result: dict, momentum_result: dict) -> dict:
     """
     配点(短期軸=5分足の根拠を主軸に、上位足は補助情報として軽く扱う設計):
       VWAP位置                10点(ATR基準の段階評価)
-      セッション高安値ブレイク  15点
+      セッションレンジ内位置    15点(段階評価)
       モメンタム(直近の勢い)   10点
       重要ライン近接           15点(ATR基準の段階評価)
-      トレンド判定(1h)        15点
+      トレンド判定(1h)        15点(スイング+EMA20の段階評価)
       環境認識(上位足整合)     10点
       DXY方向一致              10点
       米2年債方向一致           5点
@@ -508,15 +583,9 @@ def calc_score(env_score: int, trend_result: dict, macro_result: dict,
     """
     scores = {}
 
-    # --- 短期軸(5分足)の根拠を主軸に(段階評価で微小変動による反転を防止) ---
+    # --- 短期軸(5分足)の根拠を主軸に(すべて段階評価で微小変動による反転を防止) ---
     scores["VWAP位置"] = vwap_result["score"]
-
-    if breakout_result.get("aligned") is True:
-        scores["セッションブレイク"] = 15
-    elif breakout_result.get("aligned") is False:
-        scores["セッションブレイク"] = 0
-    else:
-        scores["セッションブレイク"] = 5  # レンジ内(矛盾なし)
+    scores["セッション位置"] = breakout_result["score"]
 
     if momentum_result.get("aligned") is True:
         scores["モメンタム"] = 10
@@ -526,7 +595,7 @@ def calc_score(env_score: int, trend_result: dict, macro_result: dict,
         scores["モメンタム"] = 3
 
     scores["重要ライン"] = key_level_result["score"]
-    scores["トレンド(1h)"] = 15 if trend_result["trend"] in ("上昇トレンド", "下降トレンド") else 5
+    scores["トレンド(1h)"] = trend_score_result["score"]
 
     # --- 上位足・マクロは補助情報として軽めに ---
     scores["環境認識(上位足)"] = min(10, round(env_score / 2))
@@ -613,8 +682,10 @@ def send_discord_notification(score: dict, direction: str, sltp: dict, lot: dict
         "",
         "**スコア内訳**",
     ]
-    for k in ["環境認識", "トレンド", "重要ライン", "DXY", "米2年債", "ボラティリティ", "経済指標"]:
-        lines.append(f"・{k}: {score[k]}点")
+    for k in ["VWAP位置", "セッション位置", "モメンタム", "重要ライン", "トレンド(1h)",
+              "環境認識(上位足)", "DXY", "米2年債", "ボラティリティ", "経済指標"]:
+        if k in score:
+            lines.append(f"・{k}: {score[k]}点")
 
     lines += [
         "",
@@ -736,15 +807,18 @@ def main():
     breakout_result = judge_session_breakout(df_5m, direction, lookback=24)
     momentum_result = judge_momentum(df_5m, direction, lookback=12)
 
+    trend_score_result = calc_trend_score(trend_1h, df_1h, direction)
+
     print(f"\n【短期軸(5分足)の根拠】")
     print(f"  VWAP位置: 現在値-VWAP = {vwap_result['diff']}  ATR比: {vwap_result['ratio']}  スコア: {vwap_result['score']}")
     print(f"  重要ライン最近接距離: {key_level_result['nearest_distance']}円  ATR比: {key_level_result['ratio']}  スコア: {key_level_result['score']}")
-    print(f"  セッションブレイク: {breakout_result['state']}")
+    print(f"  セッション内位置: {breakout_result['state']} ({breakout_result['position_pct']}%)  スコア: {breakout_result['score']}")
     print(f"  モメンタム(直近1時間): {momentum_result['move_pips']}pips  方向一致: {momentum_result['aligned']}")
+    print(f"  トレンド(1h): {trend_score_result['detail']}  スコア: {trend_score_result['score']}")
 
     score = calc_score(
         env_score=env["score"],
-        trend_result=trend_1h,
+        trend_score_result=trend_score_result,
         macro_result=macro,
         key_level_result=key_level_result,
         atr_ratio_ok=atr_ratio_ok,
