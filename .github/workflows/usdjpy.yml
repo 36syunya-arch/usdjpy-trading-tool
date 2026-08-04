@@ -3,9 +3,10 @@ name: USDJPY signal check
 on:
   workflow_dispatch:
   schedule:
-    # GitHub cron は UTC。JSTの平日 8:00〜24:00 をカバーする。
-    - cron: "*/20 23 * * 0-4"
-    - cron: "*/20 0-15 * * 1-5"
+    # 日本時間・平日8:07〜23:47、20分ごと
+    - cron: "7,27,47 8-23 * * 1-5"
+      timezone: "Asia/Tokyo"
+ 
 
 permissions:
   contents: read
