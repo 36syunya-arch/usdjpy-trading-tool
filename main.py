@@ -1291,6 +1291,10 @@ def send_discord_log(
     ログ送信の失敗は本処理を止めない（エントリー通知とは別扱い）。
     """
     if not webhook_url:
+        print(
+            "[ログ通知スキップ] DISCORD_LOG_WEBHOOK_URL が空です"
+            "（Secretsの登録内容とワークフローのenv設定を確認してください）"
+        )
         return
 
     now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
@@ -1341,6 +1345,7 @@ def send_discord_log(
             webhook_url, json={"content": "\n".join(lines)}, timeout=10
         )
         response.raise_for_status()
+        print(f"[ログ通知] 送信成功（HTTP {response.status_code}）")
     except Exception as error:
         print(f"[ログ通知エラー（本処理には影響なし）] {error}")
 
@@ -1455,6 +1460,11 @@ def evaluate_direction(
 
 def main() -> None:
     print("=== USDJPY デイトレ支援ツール Phase 1（安全修正版） ===\n")
+    print(
+        "【Webhook設定】"
+        f" エントリー通知: {'設定済み' if DISCORD_WEBHOOK_URL else '未設定'}"
+        f" / ログ通知: {'設定済み' if DISCORD_LOG_WEBHOOK_URL else '未設定'}"
+    )
 
     df_5m = fetch_usdjpy(interval="5m", period="5d")
     df_1h = fetch_usdjpy(interval="1h", period="60d")
