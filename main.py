@@ -977,6 +977,56 @@ import os
 # Colabで試す場合はここに直接貼ってOK。
 # GitHub Actions移行後はSecrets(環境変数)から読み込む設計にしてあります。
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "ここにWebhook URLを貼る")
+# ログ用チャンネル(見送りを含む全実行結果を記録。通知はミュート推奨)
+DISCORD_LOG_WEBHOOK_URL = os.environ.get("DISCORD_LOG_WEBHOOK_URL", "")
+
+
+def send_discord_log(score: dict, direction: str, sltp: dict, lot: dict,
+                      gate_reasons: list, extra_info: dict, webhook_url: str):
+    """毎回の実行結果をログ用チャンネルへ送る(見送りも含む)。
+    後からバックテストや検証に使えるよう、判断根拠を残すのが目的。
+    ログ送信の失敗は本処理を止めない(通知本体とは別扱い)。
+    """
+    if not webhook_url:
+        return
+
+    now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
+    direction_jp = "ロング" if direction == "long" else "ショート"
+
+    if gate_reasons:
+        verdict = "⛔ 見送り(ハードゲート)"
+    elif score["合計"] >= 80:
+        verdict = "🚨 エントリー推奨"
+    else:
+        verdict = "⏸ 見送り(点数不足)"
+
+    lines = [
+        f"`{now_jst.strftime('%m/%d %H:%M')}` **{verdict}**  合計 **{score['合計']}点**  方向: {direction_jp}",
+        f"ロング{extra_info.get('long_total','-')}点 / ショート{extra_info.get('short_total','-')}点",
+        "内訳: " + " / ".join(
+            f"{k}{score[k]}" for k in
+            ["VWAP位置", "セッション位置", "モメンタム", "重要ライン", "トレンド(1h)",
+             "環境認識(上位足)", "DXY", "米2年債", "ボラティリティ", "経済指標"]
+            if k in score
+        ),
+    ]
+
+    if sltp.get("valid"):
+        lines.append(
+            f"E:{sltp['entry']} / SL:{sltp['stop_loss']} / TP:{sltp['take_profit']} "
+            f"/ {sltp['risk_pips']}pips / 数量{lot.get('input_quantity_x1000','-')}"
+        )
+    else:
+        lines.append(f"SL/TP算出不可: {sltp.get('reason','-')}")
+
+    if gate_reasons:
+        lines.append("ゲート: " + " ; ".join(gate_reasons))
+
+    try:
+        resp = requests.post(webhook_url, json={"content": "\n".join(lines)}, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[ログ通知エラー(本処理には影響なし)] {e}")
 
 
 def send_discord_notification(score: dict, direction: str, sltp: dict, lot: dict, webhook_url: str):
@@ -1251,6 +1301,13 @@ def main():
         send_discord_notification(score, direction, sltp, lot, DISCORD_WEBHOOK_URL)
     else:
         print(f"\n[通知なし] スコア{score['合計']}点のため見送り(80点未満は通知しません)")
+
+    # --- ログ用チャンネルへは毎回記録を送信(見送りも含む) ---
+    send_discord_log(
+        score, direction, sltp, lot, gate_reasons,
+        extra_info={"long_total": long_total, "short_total": short_total},
+        webhook_url=DISCORD_LOG_WEBHOOK_URL,
+    )
 
 
 if __name__ == "__main__":
