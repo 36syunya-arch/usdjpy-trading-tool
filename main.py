@@ -102,11 +102,15 @@ def _normalize_ohlcv(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return out
 
 
-def _download_yfinance(ticker: str, label: str, **kwargs: Any) -> pd.DataFrame:
+def _download_yfinance(
+    ticker: str,
+    label: str,
+    retry_delays: tuple = (2, 5),
+    **kwargs: Any,
+) -> pd.DataFrame:
     """Yahoo の一時的な429・空レスポンスを短い間隔で再試行する。"""
     _require_dependency(yf, "yfinance")
     last_error: Optional[Exception] = None
-    retry_delays = (2, 5)
     for attempt in range(len(retry_delays) + 1):
         try:
             frame = yf.download(
@@ -150,14 +154,64 @@ def fetch_dxy(period: str = "60d", interval: str = "1d") -> pd.DataFrame:
     return _normalize_ohlcv(df, f"DXY(interval={interval})")
 
 
-def fetch_us2y_yield(days: int = 90, timeout: int = 30,
-                      retry_delays: tuple = (2, 5)) -> pd.DataFrame:
-    """FRED の日次系列 DGS2（米2年債利回り）を取得する。
+US2Y_YAHOO_TICKERS = ("2YY=F", "^UST2Y", "^IRX")
 
-    FRED は混雑時に応答が遅れることがあるため、タイムアウトを長めに取り、
-    一時的な失敗に対してリトライする。それでも取得できない場合は例外を送出し、
-    呼び出し側で「データなし」として扱う（加点せず、ハードゲートで通知停止）。
+
+def fetch_us2y_from_yfinance() -> pd.DataFrame:
+    """Yahoo Finance から米2年債利回りを取得する（メイン経路）。
+
+    FRED は GitHub Actions の共有IPからのアクセスが制限されることがあり、
+    タイムアウトが頻発する。Yahoo は USDJPY / DXY で既に利用できている
+    経路であり、日次確定値ではなく随時更新されるため、短期判断の材料としても
+    FRED の日次系列より適している。
+
+    ティッカーは廃止・変更されることがあるため、複数候補を順に試す。
+    候補はいずれも「価格」ではなく「利回り（％）」を表す点に注意。
     """
+    last_error = None
+    for ticker in US2Y_YAHOO_TICKERS:
+        try:
+            df = _download_yfinance(
+                ticker,
+                f"米2年債利回り({ticker})",
+                retry_delays=(),
+                period="1mo",
+                interval="1d",
+            )
+            normalized = _flatten_columns(df).sort_index()
+            if "close" not in normalized.columns:
+                raise RuntimeError("close 列がありません")
+            values = pd.to_numeric(normalized["close"], errors="coerce").dropna()
+            # 利回りとして妥当な範囲か検証（価格系列を誤って掴まないため）
+            if values.empty or not (0.0 <= float(values.iloc[-1]) <= 25.0):
+                raise RuntimeError(
+                    f"利回りとして不自然な値です: {values.iloc[-1] if not values.empty else 'なし'}"
+                )
+            print(f"[米2年債] Yahoo（{ticker}）から取得成功")
+            return pd.DataFrame({"yield": values})
+        except Exception as error:
+            last_error = error
+            print(f"[米2年債] {ticker} 取得失敗: {error}")
+
+    raise RuntimeError(f"Yahooの全ティッカーで取得失敗: {last_error}")
+
+
+def fetch_us2y_yield(days: int = 90, timeout: int = 20,
+                      retry_delays: tuple = (2,)) -> pd.DataFrame:
+    """米2年債利回りを取得する。
+
+    優先順位:
+      1. Yahoo Finance（既存経路・更新頻度が高い）
+      2. FRED DGS2（日次系列。Yahoo が使えない場合のフォールバック）
+
+    どちらも失敗した場合は例外を送出し、呼び出し側で「データなし」として
+    扱う（加点せず、ハードゲートで通知停止）。
+    """
+    try:
+        return fetch_us2y_from_yfinance()
+    except Exception as yahoo_error:
+        print(f"[米2年債] Yahoo取得失敗: {yahoo_error} → FREDへフォールバック")
+
     _require_dependency(requests, "requests")
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
@@ -184,12 +238,10 @@ def fetch_us2y_yield(days: int = 90, timeout: int = 30,
         except Exception as error:
             last_error = error
             if attempt < len(retry_delays):
-                print(
-                    f"[FRED取得リトライ {attempt + 1}/{len(retry_delays)}] {error}"
-                )
+                print(f"[FRED取得リトライ {attempt + 1}/{len(retry_delays)}] {error}")
                 time.sleep(retry_delays[attempt])
 
-    raise RuntimeError(f"FRED DGS2 の取得に失敗しました: {last_error}")
+    raise RuntimeError(f"米2年債利回りの取得に失敗しました（Yahoo/FRED両方）: {last_error}")
 
 
 # ============================================================
@@ -1242,7 +1294,10 @@ def send_discord_log(
         return
 
     now_jst = datetime.now(timezone.utc) + timedelta(hours=9)
-    direction_jp = "ロング" if direction == "long" else "ショート"
+    direction_jp = {
+        "long": "ロング",
+        "short": "ショート",
+    }.get(direction, "方向未確定")
 
     if gate_reasons:
         verdict = "⛔ 見送り（ハードゲート）"
@@ -1646,13 +1701,15 @@ def main() -> None:
         "long_total": eval_long["score"]["合計"],
         "short_total": eval_short["score"]["合計"],
     }
+    # best が None（方向同点で選択不可）でもログ送信でクラッシュしないようにする
+    log_direction = best["direction"] if best else "unknown"
 
     if gate_reasons:
         print(f"\n[通知なし・ハードゲート] 暫定スコア{score['合計']}点")
         for reason in dict.fromkeys(gate_reasons):
             print(f"  - {reason}")
         send_discord_log(
-            score, best["direction"], sltp, lot, gate_reasons,
+            score, log_direction, sltp, lot, gate_reasons,
             log_extra, DISCORD_LOG_WEBHOOK_URL,
         )
         return
@@ -1661,7 +1718,7 @@ def main() -> None:
             f"\n[通知なし] {score['合計']}点（基準{ENTRY_SCORE_THRESHOLD}点未満）"
         )
         send_discord_log(
-            score, best["direction"], sltp, lot, [],
+            score, log_direction, sltp, lot, [],
             log_extra, DISCORD_LOG_WEBHOOK_URL,
         )
         return
@@ -1678,7 +1735,7 @@ def main() -> None:
             f"（あと約{cooldown['remaining_minutes']}分）"
         )
         send_discord_log(
-            score, best["direction"], sltp, lot,
+            score, log_direction, sltp, lot,
             [f"重複防止（あと約{cooldown['remaining_minutes']}分）"],
             log_extra, DISCORD_LOG_WEBHOOK_URL,
         )
@@ -1696,7 +1753,7 @@ def main() -> None:
         print(f"[Discord通知エラー] {error}")
         raise
     send_discord_log(
-        score, best["direction"], sltp, lot, [],
+        score, log_direction, sltp, lot, [],
         {**log_extra, "note": "エントリー通知を送信しました"},
         DISCORD_LOG_WEBHOOK_URL,
     )
