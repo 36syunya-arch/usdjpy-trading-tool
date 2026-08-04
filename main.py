@@ -150,8 +150,14 @@ def fetch_dxy(period: str = "60d", interval: str = "1d") -> pd.DataFrame:
     return _normalize_ohlcv(df, f"DXY(interval={interval})")
 
 
-def fetch_us2y_yield(days: int = 90) -> pd.DataFrame:
-    """FRED の日次系列 DGS2（米2年債利回り）を取得する。"""
+def fetch_us2y_yield(days: int = 90, timeout: int = 30,
+                      retry_delays: tuple = (2, 5)) -> pd.DataFrame:
+    """FRED の日次系列 DGS2（米2年債利回り）を取得する。
+
+    FRED は混雑時に応答が遅れることがあるため、タイムアウトを長めに取り、
+    一時的な失敗に対してリトライする。それでも取得できない場合は例外を送出し、
+    呼び出し側で「データなし」として扱う（加点せず、ハードゲートで通知停止）。
+    """
     _require_dependency(requests, "requests")
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days)
@@ -159,14 +165,31 @@ def fetch_us2y_yield(days: int = 90) -> pd.DataFrame:
         "https://fred.stlouisfed.org/graph/fredgraph.csv"
         f"?id=DGS2&cosd={start}&coed={end}"
     )
-    response = requests.get(url, timeout=15, headers=HTTP_HEADERS)
-    response.raise_for_status()
-    df = pd.read_csv(StringIO(response.text), parse_dates=["observation_date"])
-    df = df.rename(columns={"observation_date": "date", "DGS2": "yield"})
-    if "yield" not in df.columns:
-        raise RuntimeError("FRED DGS2 の yield 列を取得できませんでした")
-    df["yield"] = pd.to_numeric(df["yield"], errors="coerce")
-    return df.dropna(subset=["yield"]).set_index("date").sort_index()
+
+    last_error = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            response = requests.get(url, timeout=timeout, headers=HTTP_HEADERS)
+            response.raise_for_status()
+            df = pd.read_csv(
+                StringIO(response.text), parse_dates=["observation_date"]
+            )
+            df = df.rename(
+                columns={"observation_date": "date", "DGS2": "yield"}
+            )
+            if "yield" not in df.columns:
+                raise RuntimeError("FRED DGS2 の yield 列を取得できませんでした")
+            df["yield"] = pd.to_numeric(df["yield"], errors="coerce")
+            return df.dropna(subset=["yield"]).set_index("date").sort_index()
+        except Exception as error:
+            last_error = error
+            if attempt < len(retry_delays):
+                print(
+                    f"[FRED取得リトライ {attempt + 1}/{len(retry_delays)}] {error}"
+                )
+                time.sleep(retry_delays[attempt])
+
+    raise RuntimeError(f"FRED DGS2 の取得に失敗しました: {last_error}")
 
 
 # ============================================================
@@ -1381,8 +1404,19 @@ def main() -> None:
     df_5m = fetch_usdjpy(interval="5m", period="5d")
     df_1h = fetch_usdjpy(interval="1h", period="60d")
     df_1d = fetch_usdjpy(interval="1d", period="1y")
-    dxy_1d = fetch_dxy(period="1mo", interval="1d")
-    us2y = fetch_us2y_yield(days=30)
+    # マクロデータは補助情報。取得に失敗しても処理は継続し、
+    # 空データとして扱う（加点されず、ハードゲートで通知は停止される）。
+    try:
+        dxy_1d = fetch_dxy(period="1mo", interval="1d")
+    except Exception as error:
+        print(f"[DXY取得失敗] {error} → データなしとして継続します")
+        dxy_1d = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+    try:
+        us2y = fetch_us2y_yield(days=30)
+    except Exception as error:
+        print(f"[米2年債取得失敗] {error} → データなしとして継続します")
+        us2y = pd.DataFrame(columns=["yield"])
 
     df_5m, drop5 = drop_unconfirmed_bar(df_5m, 5)
     df_1h, drop1h = drop_unconfirmed_bar(df_1h, 60)
